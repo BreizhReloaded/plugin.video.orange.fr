@@ -3,12 +3,16 @@
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import json
+import os
+import re
 from urllib.error import HTTPError
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from urllib.request import Request, urlopen
+import xbmcvfs
+import urllib.request
 
 from lib.providers.provider_interface import ProviderInterface
-from lib.utils import get_drm, get_global_setting, log, LogLevel, random_ua
+from lib.utils import get_drm, get_global_setting, log, LogLevel, random_ua, get_addon_profile, enable_proxy
 
 @dataclass
 class OrangeTemplate(ProviderInterface):
@@ -28,17 +32,18 @@ class OrangeTemplate(ProviderInterface):
         self.groups = groups
 
     def get_stream_info(self, channel_id: int) -> dict:
-        req = Request(self.endpoint_stream_info.format(channel_id=channel_id), headers={
+
+        enable_proxy()
+
+        res, cookie, tv_token = self._auth_urlopen(self.endpoint_stream_info.format(channel_id=channel_id), headers={
             'User-Agent': random_ua(),
             'Host': urlparse(self.endpoint_stream_info).netloc
         })
 
-        try:
-            with urlopen(req) as res:
-                stream_info = json.loads(res.read())
-        except HTTPError as error:
-            if error.code == 403:
-                return False
+        if res is None:
+            return False
+
+        stream_info = json.loads(res)
 
         drm = get_drm()
         license_server_url = None
@@ -47,6 +52,7 @@ class OrangeTemplate(ProviderInterface):
                 license_server_url = system.get('laUrl')
 
         headers = f'Content-Type=&User-Agent={random_ua()}&Host={urlparse(license_server_url).netloc}'
+        headers += f'&Cookie={quote(cookie)}&tv_token={quote(tv_token)}'
         post_data = 'R{SSM}'
         response = ''
 
@@ -63,25 +69,27 @@ class OrangeTemplate(ProviderInterface):
         return stream_info
 
     def get_streams(self) -> list:
-        req = Request(self.endpoint_streams, headers={
-            'User-Agent': random_ua(),
-            'Host': urlparse(self.endpoint_streams).netloc
-        })
-
-        with urlopen(req) as res:
-            channels = json.loads(res.read())
+        nuxt, _, _ = self._get_auth()
+        params = re.search(r'}\((.*?)\)\);', nuxt).expand(r'\1')
+        params = re.sub(r'Array\(.*?\)', '[]', params)
+        params = json.loads(f'[{params}]')
+        channels = re.search(r'{channels:(\[.*?\]),channelsPC', nuxt).expand(r'\1')
+        for rep in [ ('{', '{"'), ('}', '"}'), (':', '":"'), (',', '","'), ('}","{', '},{') ]:
+            channels = channels.replace(*rep)
+        channels = json.loads(channels)
 
         streams = []
 
         for channel in channels:
-            channel_id: str = channel['id']
+            channel_id = params[self._index(channel['idEPG'])]
+            logoindex = re.search(re.escape(channel['logos']) + r'\[3\]=.*?path:(.*?)}', nuxt).expand(r'\1')
             streams.append({
-                'id': channel_id,
-                'name': channel['name'],
-                'preset': channel['zappingNumber'],
-                'logo': channel['logos']['square'].replace('%2F/', '%2F') if 'square' in channel['logos'] else None,
+                'id': str(channel_id),
+                'name': params[self._index(channel['name'])],
+                'preset': str(params[self._index(channel['lcn'])]),
+                'logo': params[self._index(logoindex)],
                 'stream': f'plugin://plugin.video.orange.fr/channel/{channel_id}',
-                'group': [group_name for group_name in self.groups if int(channel['id']) in self.groups[group_name]]
+                'group': [group_name for group_name in self.groups if channel_id in self.groups[group_name]]
             })
 
         return streams
@@ -142,12 +150,90 @@ class OrangeTemplate(ProviderInterface):
 
         return epg
 
+    def _index(self, name):
+        table = {}
+        for i in range(26):
+            table[chr(97+i)] = i + 1
+            table[chr(65+i)] = i + 27
+        table['_'] = 53
+        table['$'] = 54
+        index = 0
+        for car in name:
+            if car == "0":
+                break
+            index *= 54
+            index += table[car]
+        return index - 1
+
+    def _get_auth(self) -> tuple:
+        timestamp = datetime.timestamp(datetime.today())
+        filepath = os.path.join(xbmcvfs.translatePath(get_addon_profile()), 'auth')
+
+        enable_proxy()
+
+        req = Request("https://chaines-tv.orange.fr", headers={
+            'User-Agent': random_ua(),
+            'Host': 'chaines-tv.orange.fr',
+        })
+
+        with urlopen(req) as res:
+            html = res.read().decode()
+            nuxt = re.search('<script>(window.*?)</script>', html).expand(r'\1')
+            cookie = res.headers['Set-Cookie'].split(";")[0]
+            tv_token = 'Bearer ' + re.search('token:"(.*?)"', nuxt).expand(r'\1')
+            auth = {'timestamp': timestamp, 'cookie': cookie, 'tv_token': tv_token}
+            with open(filepath, 'w', encoding='UTF-8') as file:
+                file.write(json.dumps(auth))
+
+        return nuxt, cookie, tv_token
+
+    def _auth_urlopen(self, url: str, headers: dict = None) -> tuple:
+        if headers is None:
+            headers = {}
+        timestamp = datetime.timestamp(datetime.today())
+        filepath = os.path.join(xbmcvfs.translatePath(get_addon_profile()), 'auth')
+
+        try:
+            with open(filepath, encoding='UTF-8') as file:
+                auth = json.loads(file.read())
+        except FileNotFoundError:
+            auth = {'timestamp': timestamp}
+
+        for _ in range(2):
+            if 'cookie' in auth:
+                headers['cookie'] = auth['cookie']
+                headers['tv_token'] = auth['tv_token']
+
+                enable_proxy()
+
+                req = Request(url, headers=headers)
+
+                try:
+                    with urlopen(req) as res:
+                        if res.code == 200:
+                            return res.read(), auth['cookie'], auth['tv_token']
+                except HTTPError as error:
+                    if error.code == 403:
+                        log("Cette chaîne ne fait pas partie de votre offre.", LogLevel.INFO)
+                        break
+                    if error.code == 401:
+                        log(f"Cookie/token invalide, âge = {int(timestamp - auth['timestamp'])}", LogLevel.INFO)
+                    else:
+                        log(f"Erreur {error}", LogLevel.INFO)
+                        raise
+
+            _, auth['cookie'], auth['tv_token'] = self._get_auth()
+
+        return None, None, None
+
     def _get_programs(self, period_start: int = None, period_end: int = None) -> list:
         """Returns the programs for today (default) or the specified period"""
         try:
             period = f'{int(period_start)},{int(period_end)}'
         except ValueError:
             period = 'today'
+
+        enable_proxy()
 
         req = Request(self.endpoint_programs.format(period=period), headers={
             'User-Agent': random_ua(),
